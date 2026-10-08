@@ -1,0 +1,1433 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>InMarket DOOH Proof of Placement Mock up tool</title>
+<meta name="description" content="Warp campaign creative onto the screens in out-of-home placement photography and build the proof-of-placement deck.">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700;800&display=swap">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script>
+/* ---------------------------------------------------------------------------
+   Standalone capability shim.
+
+   Inside the Claude artifact runtime window.claude.use() hands back a hosted
+   document store, a download broker and an asset store. Served from a plain web
+   server none of that exists, so the same three names are filled in here from
+   browser primitives: anchor downloads, IndexedDB for added placement photos,
+   and nothing at all for the document store (pin edits already fall back to
+   localStorage in the app itself).
+--------------------------------------------------------------------------- */
+(function(){
+  const DB_NAME = "inmarket-dooh", STORE = "blobs";
+  function open_(){
+    return new Promise((res, rej) => {
+      const r = indexedDB.open(DB_NAME, 1);
+      r.onupgradeneeded = () => r.result.createObjectStore(STORE);
+      r.onsuccess = () => res(r.result);
+      r.onerror   = () => rej(r.error);
+    });
+  }
+  function tx(mode, fn){
+    return open_().then(d => new Promise((res, rej) => {
+      const t = d.transaction(STORE, mode), q = fn(t.objectStore(STORE));
+      t.oncomplete = () => res(q && q.result);
+      t.onerror    = () => rej(t.error);
+    }));
+  }
+  const put = (k, v) => tx("readwrite", s => s.put(v, k));
+  const get = k      => tx("readonly",  s => s.get(k));
+
+  const downloads = {
+    save({filename, data}){
+      const url = URL.createObjectURL(data);
+      const a = document.createElement("a");
+      a.href = url; a.download = filename;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 30000);
+      return Promise.resolve();
+    }
+  };
+
+  const assets = {
+    async upload(file){
+      const id = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()))
+                   .replace(/-/g, "").slice(0, 20);
+      await put(id, file);
+      return {id, url: URL.createObjectURL(file)};
+    }
+  };
+
+  window.__cap = async function(name){
+    try{
+      const real = await (window.claude && window.claude.use && window.claude.use(name));
+      if(real) return real;
+    }catch(e){}
+    if(name === "downloads") return downloads;
+    if(name === "assets")    return assets;
+    return null;                       // no document store off-platform
+  };
+
+  /* Added photos are kept as blobs; their object URLs die with the page, so the
+     ids saved in localStorage are resolved back into fresh URLs on each load. */
+  window.__rehydrate = async function(){
+    if(typeof photos === "undefined") return;
+    let changed = false;
+    for(const p of photos){
+      if(!p.custom || !p.assetId) continue;
+      try{
+        const blob = await get(p.assetId);
+        if(blob){ p.src = p.thumb = URL.createObjectURL(blob); changed = true; }
+      }catch(e){}
+    }
+    if(changed && typeof drawGrid === "function") drawGrid();
+  };
+})();
+</script>
+</head>
+<body>
+<style>
+:root{
+  color-scheme:light;
+  /* InMarket 2025 Brand Guidelines v1.2 — light scheme */
+  --metric:#121E33; --command:#243E66; --magnet:#4591C7; --lead:#AED7F4;
+  --display:#C7E6FC; --conversion:#D5E3ED; --framework:#F5F6F8; --cell:#FFFFFF;
+  --green:#7DBE42; --beacon:#84D828;
+
+  --ground:var(--framework);     /* Framework Gray background  */
+  --panel:var(--cell);           /* Cell White cards           */
+  --panel-2:#EDF3F8; --raise:var(--cell);
+  --line:var(--conversion); --line-soft:#E4EDF4;
+  --text:var(--metric);          /* Metric Blue text           */
+  --emph:var(--command);         /* Command Blue emphasis      */
+  --muted:#3F577D; --dim:#79909F;
+  --accent:var(--magnet);        /* Magnet Blue links / active */
+  --good:#5C9B2A; --pin:var(--beacon); --warn:#A8761A;
+  --well:var(--conversion);      /* letterboxing behind photos */
+
+  --r-card:16px; --r-modal:24px; --r-ctl:10px;
+  --shadow:0 4px 2px rgba(18,30,51,.10);
+  --dots:radial-gradient(rgba(18,30,51,.25) 1px, transparent 1.1px);
+  --ui:"Montserrat","Helvetica Neue",Arial,sans-serif;
+  --mono:"Montserrat","Helvetica Neue",Arial,sans-serif;
+}
+.count,.nm,.tag,.sub,.coords,.rn,.nmx,#phint,.pill,.keys,.prow .tx{
+  font-variant-numeric:tabular-nums;letter-spacing:.01em;
+}
+html,body{height:100%}
+body{margin:0;background:var(--dots) 0 0/22px 22px,linear-gradient(to top,rgba(174,215,244,.55) 0%,rgba(174,215,244,0) 66%),var(--ground);color:var(--text);font-family:var(--ui);font-size:14px;line-height:1.45;-webkit-font-smoothing:antialiased}
+*{box-sizing:border-box}
+button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
+h2{font-size:15px;font-weight:700;margin:0}
+
+#app{height:100%;display:grid;grid-template-rows:auto minmax(0,1fr);}
+
+/* header */
+#head{
+  display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:10px 18px;
+  padding-top:calc(10px + env(safe-area-inset-top,0px));
+  border-bottom:1px solid var(--line);background:var(--panel);
+}
+.brand{display:flex;align-items:center;gap:12px}
+.brand img{height:22px;width:auto;display:block}
+.brand span{border-left:1px solid var(--line);padding-left:12px}
+.brand span{color:var(--emph);font-size:11px;text-transform:uppercase;letter-spacing:.14em;font-weight:600}
+#steps{display:flex;gap:4px;margin-left:8px}
+.step{
+  display:flex;align-items:center;gap:7px;border:1px solid transparent;border-radius:8px;
+  padding:6px 12px;font-size:12.5px;color:var(--muted);font-weight:600;
+}
+.step b{
+  width:18px;height:18px;border-radius:50%;background:var(--conversion);color:var(--muted);
+  font-family:var(--mono);font-size:10px;display:grid;place-items:center;font-weight:400;
+}
+.step:hover{color:var(--text)}
+.step[aria-current="true"]{background:var(--panel-2);border-color:var(--line);color:var(--emph)}
+.step[aria-current="true"] b{background:var(--metric);color:var(--cell);font-weight:700}
+.step.done b{background:var(--green);color:#15310A;font-weight:700}
+#headright{margin-left:auto;display:flex;align-items:center;gap:10px}
+#conn{font-family:var(--mono);font-size:11px;color:var(--dim)}
+#conn.ok{color:var(--good)}
+.btn{border:1px solid var(--line);border-radius:var(--r-ctl);padding:7px 14px;font-size:12.5px;font-weight:600;background:var(--panel)}
+.btn:hover{border-color:var(--accent);color:var(--emph)}
+.btn.pri{background:var(--metric);border-color:var(--metric);color:var(--cell);font-weight:700}
+.btn.pri:hover{background:var(--command);border-color:var(--command);color:var(--cell)}
+.btn[disabled]{opacity:.42;cursor:not-allowed}
+.btn[disabled]:hover{border-color:var(--line);color:inherit;filter:none}
+
+/* views */
+main{overflow-y:auto;padding:18px;padding-bottom:calc(28px + env(safe-area-inset-bottom,0px))}
+.view{max-width:1500px;margin:0 auto;display:flex;flex-direction:column;gap:16px}
+.bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.bar .spacer{flex:1}
+.count{font-family:var(--mono);font-size:12px;color:var(--muted)}
+.chip{border:1px solid var(--line);border-radius:999px;padding:5px 13px;font-size:12px;color:var(--muted);background:var(--panel)}
+.chip:hover{color:var(--text)}
+.chip[aria-pressed="true"]{background:var(--metric);border-color:var(--metric);color:var(--cell)}
+.btn.danger:hover{border-color:#B3261E;color:#B3261E}
+.ghead{
+  grid-column:1/-1;display:flex;align-items:center;gap:10px;margin:10px 2px -2px;
+}
+.ghead:first-child{margin-top:0}
+.ghead .gname{font-weight:700;font-size:12.5px;color:var(--emph);font-variant-numeric:tabular-nums}
+.ghead .gcount{font-size:11px;color:var(--dim)}
+.ghead i{flex:1;height:1px;background:var(--line)}
+.ghead .gsel{font-size:11px;color:var(--accent);font-weight:600;padding:2px 4px}
+.ghead .gsel:hover{color:var(--emph);text-decoration:underline}
+.card.gone{opacity:.45}
+.card.gone .ph{filter:grayscale(1)}
+.card.dupe{border-color:var(--warn);box-shadow:0 0 0 1px var(--warn)}
+.badge{
+  position:absolute;left:8px;bottom:42px;border-radius:5px;padding:2px 7px;font-size:10px;font-weight:700;
+  background:var(--warn);color:#fff;letter-spacing:.02em;
+}
+.lbl{font-size:10.5px;letter-spacing:.11em;text-transform:uppercase;color:var(--dim);font-weight:700}
+.note{font-size:12.5px;color:var(--dim);line-height:1.55;max-width:70ch}
+
+/* placement grid */
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(178px,1fr));gap:12px}
+.card{
+  position:relative;border:1px solid var(--line-soft);border-radius:var(--r-card);overflow:hidden;
+  background:var(--panel);text-align:left;padding:0;box-shadow:var(--shadow);
+}
+.card .ph{display:block;width:100%;aspect-ratio:4/3;object-fit:cover;background:var(--well)}
+.card .meta{display:flex;align-items:center;gap:7px;padding:7px 9px;border-top:1px solid var(--line-soft)}
+.card .nm{font-family:var(--mono);font-size:11px;color:var(--muted)}
+.card .tag{margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--dim)}
+.card.sel{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
+.card.sel .nm{color:var(--text)}
+.tick{
+  position:absolute;left:8px;top:8px;width:21px;height:21px;border-radius:6px;
+  border:1.5px solid rgba(18,30,51,.35);background:rgba(255,255,255,.80);
+  display:grid;place-items:center;color:transparent;font-size:12px;line-height:1;backdrop-filter:blur(3px);
+}
+.card.sel .tick{background:var(--metric);border-color:var(--metric);color:var(--cell)}
+.edit{
+  position:absolute;right:8px;top:8px;border-radius:6px;padding:3px 8px;font-size:10.5px;
+  background:rgba(255,255,255,.88);border:1px solid rgba(18,30,51,.16);color:var(--emph);
+  opacity:0;transition:opacity .12s;backdrop-filter:blur(3px);
+}
+.card:hover .edit{opacity:1}
+.edit:hover{background:var(--metric);border-color:var(--metric);color:var(--cell)}
+.addcard{
+  border:1px dashed var(--line);border-radius:var(--r-card);background:transparent;color:var(--muted);
+  display:grid;place-items:center;gap:6px;min-height:170px;font-size:12.5px;text-align:center;padding:12px;
+}
+.addcard:hover{border-color:var(--accent);color:var(--text)}
+.addcard i{font-style:normal;font-size:22px;color:var(--dim)}
+
+/* creatives */
+.drop{
+  border:1.5px dashed var(--line);border-radius:var(--r-modal);padding:34px 20px;text-align:center;
+  background:var(--panel);display:flex;flex-direction:column;align-items:center;gap:9px;
+}
+.drop.hot{border-color:var(--accent);background:var(--panel-2)}
+.drop h2{font-size:16px}
+.crlist{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:11px}
+.cr{display:flex;gap:11px;align-items:center;border:1px solid var(--line-soft);border-radius:var(--r-ctl);padding:9px;background:var(--panel)}
+.cr img{width:58px;height:58px;object-fit:contain;background:var(--well);border-radius:7px;flex:none}
+.cr .t{min-width:0;display:flex;flex-direction:column;gap:2px}
+.cr .fn{font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cr .sub{font-family:var(--mono);font-size:10.5px;color:var(--dim)}
+.cr .x{margin-left:auto;color:var(--dim);font-size:17px;line-height:1;padding:2px 4px}
+.cr .x:hover{color:var(--pin)}
+.pillrow{display:flex;gap:6px;flex-wrap:wrap}
+.pill{font-family:var(--mono);font-size:10.5px;border:1px solid var(--line);border-radius:999px;padding:3px 9px;color:var(--muted)}
+.pill.bad{border-color:var(--pin);color:var(--pin)}
+.pill.ok{border-color:var(--good);color:var(--good)}
+
+/* render grid */
+.rgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:13px}
+.rc{border:1px solid var(--line-soft);border-radius:var(--r-card);box-shadow:var(--shadow);overflow:hidden;background:var(--panel);display:flex;flex-direction:column}
+.rc canvas{display:block;width:100%;height:auto;aspect-ratio:4/3;background:var(--well)}
+.rc .rb{display:flex;align-items:center;gap:7px;padding:7px 9px;border-top:1px solid var(--line-soft)}
+.rc .rn{font-family:var(--mono);font-size:11px;color:var(--muted);flex:none}
+.rc select{
+  margin-left:auto;max-width:62%;background:var(--panel-2);color:var(--text);border:1px solid var(--line);
+  border-radius:6px;padding:3px 6px;font:inherit;font-size:11px;
+}
+.deckbar input{
+  background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:var(--r-ctl);
+  padding:7px 11px;font:inherit;font-size:12.5px;flex:0 1 250px;min-width:170px;
+}
+.deckbar input:focus{outline:none;border-color:var(--accent)}
+.deckbar input::placeholder{color:var(--dim)}
+#prog{height:5px;border-radius:3px;background:var(--conversion);overflow:hidden;display:none}
+#prog i{display:block;height:100%;background:var(--metric);width:0%;transition:width .15s}
+
+/* empty state */
+.empty{border:1px solid var(--line-soft);border-radius:var(--r-modal);box-shadow:var(--shadow);padding:26px;background:var(--panel);display:flex;flex-direction:column;gap:10px;align-items:flex-start}
+
+/* pin editor */
+dialog{border:1px solid var(--line);background:var(--panel);color:var(--text);border-radius:var(--r-modal);box-shadow:var(--shadow);padding:0;max-width:min(1180px,95vw);width:100%}
+dialog::backdrop{background:rgba(18,30,51,.42)}
+.dh{display:flex;align-items:center;gap:12px;padding:12px 15px;border-bottom:1px solid var(--line)}
+.dh .nmx{font-family:var(--mono);font-size:12.5px;color:var(--muted)}
+.db{display:grid;grid-template-columns:minmax(0,1fr) 226px;gap:0}
+#pstage{position:relative;height:min(64vh,620px);overflow:hidden;cursor:crosshair;touch-action:none;
+  background:var(--ground) var(--dots) 0 0/22px 22px;border-right:1px solid var(--line)}
+#pscene{position:absolute;top:0;left:0;transform-origin:0 0}
+#pscene img{display:block;position:absolute;top:0;left:0;max-width:none;max-height:none;user-select:none;-webkit-user-drag:none}
+/* the warped preview is positioned by matrix3d, which needs the corner as origin */
+#pscene img.ov{transform-origin:0 0;pointer-events:none}
+#ppins{position:absolute;top:0;left:0;overflow:visible;pointer-events:none}
+#ploupe{position:absolute;width:140px;height:140px;border-radius:50%;border:2px solid var(--cell);overflow:hidden;
+  pointer-events:none;display:none;z-index:6;box-shadow:0 8px 26px rgba(0,0,0,.6);background:#000}
+#ploupe .cx{position:absolute;inset:0}
+#ploupe .cx:before,#ploupe .cx:after{content:"";position:absolute;background:var(--pin)}
+#ploupe .cx:before{left:50%;top:0;bottom:0;width:1px;margin-left:-.5px}
+#ploupe .cx:after{top:50%;left:0;right:0;height:1px;margin-top:-.5px}
+#phint{position:absolute;left:10px;bottom:10px;background:rgba(255,255,255,.95);border:1px solid var(--line);
+  border-radius:8px;padding:6px 10px;font-family:var(--mono);font-size:11px;color:var(--muted);z-index:5}
+#phint b{color:#3F7A14}
+.dside{padding:13px;display:flex;flex-direction:column;gap:13px;overflow-y:auto}
+.crd{display:flex;flex-direction:column;gap:7px}
+.abtn{border:1px solid var(--line);border-radius:7px;padding:7px 8px;font-size:12px;background:var(--panel-2);text-align:center;font-weight:600;flex:1}
+.abtn:hover{border-color:var(--accent);color:var(--emph)}
+.abtn.danger:hover{border-color:var(--pin);color:var(--pin)}
+.coords{font-family:var(--mono);font-size:10.5px;color:var(--dim);display:grid;gap:2px}
+.coords div{display:flex;justify-content:space-between;gap:8px}
+.plist{display:flex;flex-direction:column;gap:6px}
+.prow{display:flex;align-items:center;gap:7px;border:1px solid var(--line-soft);border-radius:7px;padding:6px 8px;background:var(--panel-2);font-size:11.5px}
+.prow[aria-current="true"]{border-color:var(--accent)}
+.prow .tx{flex:1;text-align:left;color:var(--muted);font-family:var(--mono);font-size:10.5px}
+.prow .x{color:var(--dim);font-size:15px;line-height:1}
+.prow .x:hover{color:var(--pin)}
+
+#toast{
+  position:fixed;left:50%;transform:translateX(-50%);bottom:24px;z-index:50;
+  background:var(--metric);color:var(--cell);border:1px solid var(--metric);border-radius:9px;padding:10px 16px;
+  font-size:13px;box-shadow:0 10px 34px rgba(0,0,0,.5);display:none;max-width:min(560px,90vw)
+}
+#toast.bad{background:#7A2718;border-color:#7A2718;color:#FFE4DE}
+
+@media (max-width:900px){
+  .db{grid-template-columns:minmax(0,1fr)}
+  #pstage{height:44vh;border-right:none;border-bottom:1px solid var(--line)}
+  #steps{order:3;width:100%}
+}
+</style>
+
+<div id="app">
+  <header id="head">
+    <div class="brand"><img src="inmarket-logo.png" srcset="inmarket-logo.png 1x, inmarket-logo@2x.png 2x" alt="InMarket" width="363" height="64"><span>DOOH Proof of Placement</span></div>
+    <nav id="steps">
+      <button class="step" data-v="place" aria-current="true"><b>1</b>Placements</button>
+      <button class="step" data-v="creative"><b>2</b>Creatives</button>
+      <button class="step" data-v="render"><b>3</b>Render</button>
+    </nav>
+    <div id="headright">
+      <span id="conn">connecting&hellip;</span>
+      <button class="btn pri" id="go">Continue &rarr;</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- 1. PLACEMENTS -->
+    <section class="view" id="v-place">
+      <div class="bar">
+        <h2>Choose placements</h2>
+        <span class="count" id="selcount"></span>
+        <div class="spacer"></div>
+        <button class="btn" id="sel-all">Select all</button>
+        <button class="btn" id="sel-none">Clear</button>
+        <button class="btn" id="scan-dupes">Find duplicates</button>
+        <button class="btn danger" id="remove">Remove selected</button>
+      </div>
+      <div class="bar">
+        <div class="pillrow" id="chips"></div>
+        <div class="spacer"></div>
+        <button class="chip" id="show-removed" aria-pressed="false" hidden>Removed</button>
+      </div>
+      <p class="note">Tick the locations for this run. Corner pins are already set for all 35 &mdash; hover a card and hit <b>Pins</b> to adjust one, or add a new location at the end of the grid. Cards are grouped by the creative size each screen needs.</p>
+      <div class="grid" id="pgrid"></div>
+    </section>
+
+    <!-- 2. CREATIVES -->
+    <section class="view" id="v-creative" hidden>
+      <div class="bar"><h2>Load this run's creatives</h2><div class="spacer"></div>
+        <button class="btn" id="cr-clear">Remove all</button></div>
+      <div class="drop" id="drop">
+        <h2>Drop creative files here</h2>
+        <p class="note" style="text-align:center">PNG or JPG, any size. They stay on your machine &mdash; the warp runs in this browser and nothing is uploaded.</p>
+        <button class="btn pri" id="pick">Choose files</button>
+        <input type="file" id="crfile" accept="image/png,image/jpeg,image/webp" multiple hidden>
+      </div>
+      <div class="pillrow" id="ratios"></div>
+      <div class="crlist" id="crlist"></div>
+    </section>
+
+    <!-- 3. RENDER -->
+    <section class="view" id="v-render" hidden>
+      <div class="bar">
+        <h2>Review and export</h2>
+        <span class="count" id="rcount"></span>
+        <div class="spacer"></div>
+        <button class="btn" id="dl-jpg">Download JPGs</button>
+        <button class="btn" id="dl-png">Layer PNGs</button>
+        <button class="btn" id="dl-deck">Swap into a deck&hellip;</button>
+        <input type="file" id="deckfile" accept=".pptx" hidden>
+        <button class="btn pri" id="mk-deck">Build InMarket deck</button>
+      </div>
+      <div class="bar deckbar">
+        <span class="lbl">Deck cover</span>
+        <input id="deck-title" type="text" placeholder="Deck title" maxlength="80">
+        <input id="deck-sub" type="text" placeholder="Subhead" maxlength="80">
+        <span class="note" style="font-size:11.5px;margin:0">One slide per placement, on the 2025 InMarket template.</span>
+      </div>
+      <div id="prog"><i></i></div>
+      <div id="rbody"></div>
+    </section>
+  </main>
+</div>
+
+<dialog id="pindlg">
+  <div class="dh">
+    <b>Corner pins</b><span class="nmx" id="pnm"></span>
+    <div style="margin-left:auto;display:flex;gap:8px">
+      <button class="btn" id="preset">Reset to saved</button>
+      <button class="btn pri" id="pdone">Done</button>
+    </div>
+  </div>
+  <div class="db">
+    <div id="pstage">
+      <div id="pscene"><img id="pimg" alt=""><svg id="ppins" xmlns="http://www.w3.org/2000/svg"></svg></div>
+      <div id="ploupe"><canvas width="140" height="140"></canvas><div class="cx"></div></div>
+      <div id="phint"></div>
+    </div>
+    <div class="dside">
+      <div class="crd"><span class="lbl">Screens</span><div class="plist" id="pplist"></div>
+        <div style="display:flex;gap:6px"><button class="abtn" id="padd">+ Add screen</button></div></div>
+      <div class="crd"><span class="lbl">Corners</span><div class="coords" id="pcoords"></div>
+        <div style="display:flex;gap:6px"><button class="abtn" id="pundo">Undo</button><button class="abtn danger" id="pclear">Clear</button></div></div>
+      <p class="note" style="font-size:11px">Click the four corners in order &mdash; top-left, top-right, bottom-right, bottom-left. Drag a dot to nudge. Wheel zooms.</p>
+    </div>
+  </div>
+</dialog>
+
+<div id="toast"></div>
+
+<script>
+const DATA = {"photos":[["slide-01",1300,740],["slide-02",640,478],["slide-03",2047,1535],["slide-04",2047,1535],["slide-05",2047,1535],["slide-06",2047,1535],["slide-07",268,480],["slide-08",800,977],["slide-09",640,364],["slide-10",268,480],["slide-11",268,480],["slide-12",640,478],["slide-13",640,357],["slide-14",720,450],["slide-15",720,480],["slide-16",720,480],["slide-17",720,483],["slide-18",720,480],["slide-19",720,480],["slide-20",720,508],["slide-21",720,511],["slide-22",945,2045],["slide-23",945,2045],["slide-24",453,768],["slide-25",1019,1600],["slide-26",1024,768],["slide-27",1537,1023],["slide-28",1537,1023],["slide-29",1536,2048],["slide-30",1536,2048],["slide-31",2000,1429],["slide-32",2000,1429],["slide-33",2047,1727],["slide-34",945,2045],["slide-35",1429,2000]],"pins":{"slide-01":[[0.30214,0.20493,0.65985,0.20835,0.65816,0.56217,0.30344,0.56221]],"slide-02":[[0.40239,0.20538,0.60175,0.20513,0.60099,0.68335,0.40136,0.68361]],"slide-03":[[0.43992,0.22657,0.54801,0.2346,0.54337,0.31941,0.43795,0.31494]],"slide-04":[[0.41376,0.15965,0.58469,0.17461,0.57681,0.30645,0.40942,0.29701]],"slide-05":[[0.49531,0.40566,0.56185,0.40864,0.56153,0.46018,0.49556,0.45524]],"slide-06":[[0.26088,0.11958,0.49043,0.13597,0.48915,0.31455,0.26258,0.29635]],"slide-07":[[0.21992,0.09053,0.51091,0.13405,0.50834,0.46321,0.23049,0.46831]],"slide-08":[[0.36129,0.27252,0.79889,0.2779,0.81154,0.54232,0.36612,0.5476]],"slide-09":[[0.30264,0.20503,0.66018,0.20436,0.66074,0.56295,0.30159,0.56538]],"slide-10":[[0.22052,0.08909,0.51084,0.1335,0.50826,0.46315,0.23269,0.46753]],"slide-11":[[0.39833,0.25446,0.65989,0.26275,0.66152,0.54067,0.39862,0.54376]],"slide-12":[[0.402,0.20548,0.60268,0.20644,0.60261,0.68146,0.40256,0.68105]],"slide-13":[[0.40949,0.18717,0.73093,0.1432,0.73099,0.51664,0.40932,0.51493]],"slide-14":[[0.36927,0.19256,0.4965,0.20216,0.49321,0.56355,0.36564,0.57163]],"slide-15":[[0.46047,0.41165,0.52891,0.41598,0.52768,0.60245,0.45881,0.60495]],"slide-16":[[0.43703,0.36054,0.54025,0.36486,0.53965,0.63699,0.4361,0.64138]],"slide-17":[[0.0822,0.31696,0.28454,0.35181,0.28291,0.84845,0.07774,0.87132],[0.35921,0.36735,0.50256,0.39625,0.50872,0.81384,0.36217,0.83143]],"slide-18":[[0.18323,0.17876,0.41648,0.16878,0.41282,0.82905,0.16793,0.8207],[0.52632,0.17017,0.75961,0.17279,0.78453,0.82313,0.52826,0.82605]],"slide-19":[[0.35556,0.23554,0.53457,0.24698,0.53309,0.71864,0.34931,0.72479],[0.60875,0.25336,0.76063,0.26924,0.77335,0.70353,0.61261,0.71058]],"slide-20":[[0.20151,0.41255,0.50964,0.43333,0.51456,0.67005,0.20306,0.69392]],"slide-21":[[0.2621,0.33902,0.64722,0.36134,0.65605,0.65771,0.26389,0.69146]],"slide-22":[[0.44476,0.37313,0.55854,0.37586,0.55739,0.4747,0.44588,0.47617]],"slide-23":[[0.42487,0.36188,0.54882,0.36343,0.54943,0.46735,0.43144,0.46941]],"slide-24":[[0.3654,0.3289,0.64295,0.33254,0.63362,0.60196,0.38556,0.59968]],"slide-25":[[0.25914,0.24854,0.6768,0.2479,0.65175,0.70517,0.26374,0.69886]],"slide-26":[[0.38282,0.32843,0.50647,0.33254,0.50284,0.60251,0.39177,0.59971]],"slide-27":[[0.42701,0.09696,0.55349,0.1519,0.5544,0.4962,0.4248,0.48437]],"slide-28":[[0.40589,0.10685,0.6076,0.16967,0.61396,0.76706,0.40602,0.75739]],"slide-29":[[0.32643,0.19873,0.59624,0.19837,0.58557,0.55372,0.33169,0.55024]],"slide-30":[[0.31236,0.22999,0.63856,0.17948,0.64371,0.70301,0.31754,0.67482]],"slide-31":[[0.43591,0.34621,0.60926,0.3548,0.61019,0.85984,0.43951,0.89052]],"slide-32":[[0.39813,0.16173,0.63754,0.07525,0.63753,0.84323,0.39463,0.78049]],"slide-33":[[0.47111,0.26771,0.61649,0.27193,0.61202,0.37264,0.46957,0.37001]],"slide-34":[[0.35993,0.26651,0.5575,0.26999,0.55829,0.43702,0.37025,0.43915]],"slide-35":[[0.38496,0.09212,0.76759,0.24572,0.77248,0.85042,0.37563,0.97378]]}};
+const CORNERS = ["top-left","top-right","bottom-right","bottom-left"];
+const el = id => document.getElementById(id);
+
+/* ---------------- state ---------------- */
+let photos = DATA.photos.map(([id,w,h]) => ({id, w, h, src:"p/"+id+".jpg", thumb:"t/"+id+".jpg", custom:false}));
+let pins   = {};                      // photoId -> [{pts:[[x,y]x4], ov:null|int}]
+let selected = new Set();
+let creatives = [];                   // {name, img, w, h, ratio, group}
+let filter = "all", view = "place";
+let removed = new Set(), showRemoved = false, dupeOf = {};
+let db = null, assets = null, downloads = null;
+
+for (const [pid, arr] of Object.entries(DATA.pins))
+  pins[pid] = arr.map(f => ({ pts: [[f[0],f[1]],[f[2],f[3]],[f[4],f[5]],[f[6],f[7]]], ov: null }));
+photos.forEach(p => selected.add(p.id));
+
+const photoById = id => photos.find(p => p.id === id);
+function toast(msg, bad){
+  const t = el("toast"); t.textContent = msg; t.className = bad ? "bad" : "";
+  t.style.display = "block"; clearTimeout(t._t);
+  t._t = setTimeout(() => t.style.display = "none", bad ? 6500 : 3000);
+}
+
+/* ---------------- persistence ---------------- */
+const lsKey = "studio.v1";
+function lsSave(){
+  try{ localStorage.setItem(lsKey, JSON.stringify({
+    pins, sel:[...selected], rm:[...removed], custom: photos.filter(p=>p.custom) })); }catch(e){}
+}
+let timers = {};
+function savePins(pid){
+  lsSave();
+  if(!db) return;
+  clearTimeout(timers[pid]);
+  timers[pid] = setTimeout(async () => {
+    try{
+      await db.doc("pins/"+pid).set({
+        photo: pid,
+        items: (pins[pid]||[]).filter(i=>i.pts.length===4)
+                 .map(i=>({points:i.pts, override:(i.ov==null?null:i.ov)})),
+        updatedAt: new Date().toISOString()
+      });
+    }catch(e){ toast("Couldn't save pins for "+pid+" — kept locally", true); }
+  }, 400);
+}
+function saveRemoved(){
+  lsSave();
+  if(!db) return;
+  clearTimeout(timers.__rm);
+  timers.__rm = setTimeout(async () => {
+    try{ await db.doc("prefs/removed").set({ ids:[...removed], updatedAt:new Date().toISOString() }); }
+    catch(e){ toast("Couldn't save the removals — kept locally", true); }
+  }, 400);
+}
+function saveSelection(){
+  lsSave();
+  if(!db) return;
+  clearTimeout(timers.__sel);
+  timers.__sel = setTimeout(async () => {
+    try{ await db.doc("prefs/selection").set({ ids:[...selected], updatedAt:new Date().toISOString() }); }
+    catch(e){}
+  }, 500);
+}
+
+/* ---------------- geometry ---------------- */
+function adj(m){return [m[4]*m[8]-m[5]*m[7],m[2]*m[7]-m[1]*m[8],m[1]*m[5]-m[2]*m[4],
+                        m[5]*m[6]-m[3]*m[8],m[0]*m[8]-m[2]*m[6],m[2]*m[3]-m[0]*m[5],
+                        m[3]*m[7]-m[4]*m[6],m[1]*m[6]-m[0]*m[7],m[0]*m[4]-m[1]*m[3]];}
+function mmm(a,b){const c=[];for(let i=0;i<3;i++)for(let j=0;j<3;j++){let s=0;for(let k=0;k<3;k++)s+=a[3*i+k]*b[3*k+j];c[3*i+j]=s;}return c;}
+function mmv(m,v){return [m[0]*v[0]+m[1]*v[1]+m[2]*v[2],m[3]*v[0]+m[4]*v[1]+m[5]*v[2],m[6]*v[0]+m[7]*v[1]+m[8]*v[2]];}
+function basis(x1,y1,x2,y2,x3,y3,x4,y4){
+  const m=[x1,x2,x3,y1,y2,y3,1,1,1], v=mmv(adj(m),[x4,y4,1]);
+  return mmm(m,[v[0],0,0, 0,v[1],0, 0,0,v[2]]);
+}
+/** homography mapping the unit square (TL,TR,BR,BL) onto dst pixel corners */
+function unitToQuad(d){
+  return mmm(basis(d[0][0],d[0][1], d[1][0],d[1][1], d[3][0],d[3][1], d[2][0],d[2][1]),
+             adj(basis(0,0, 1,0, 0,1, 1,1)));
+}
+function cssMatrix(w,h,d){
+  const t = mmm(basis(d[0][0],d[0][1], d[1][0],d[1][1], d[3][0],d[3][1], d[2][0],d[2][1]),
+                adj(basis(0,0, w,0, 0,h, w,h)));
+  for(let i=0;i<9;i++) t[i]/=t[8];
+  return "matrix3d("+[t[0],t[3],0,t[6], t[1],t[4],0,t[7], 0,0,1,0, t[2],t[5],0,t[8]].map(n=>n.toFixed(8)).join(",")+")";
+}
+function quadPx(pid, pts){ const p = photoById(pid); return pts.map(q => [q[0]*p.w, q[1]*p.h]); }
+function quadSize(px){
+  const d=(a,b)=>Math.hypot(px[a][0]-px[b][0], px[a][1]-px[b][1]);
+  return [Math.max(1,(d(0,1)+d(3,2))/2), Math.max(1,(d(0,3)+d(1,2))/2)];
+}
+
+/* ---------------- creative grouping ---------------- */
+function groupOf(r){ return r < 0.85 ? "portrait" : (r > 1.2 ? "landscape" : "square"); }
+function needFor(pid, item){ return groupOf(quadSize(quadPx(pid,item.pts))[0] / quadSize(quadPx(pid,item.pts))[1]); }
+function poolFor(g){
+  const exact = creatives.filter(c => c.group === g);
+  return exact.length ? exact : creatives.slice();
+}
+/** which creative a screen gets: explicit override index within its pool, else round-robin */
+function creativeFor(pid, idx){
+  const item = pins[pid][idx];
+  const pool = poolFor(needFor(pid, item));
+  if(!pool.length) return null;
+  if(item.ov != null && pool[item.ov]) return pool[item.ov];
+  let n = 0;
+  for(const p of photos){
+    if(!selected.has(p.id) || !pins[p.id]) continue;
+    for(let k=0;k<pins[p.id].length;k++){
+      if(needFor(p.id, pins[p.id][k]) !== needFor(pid, item)) continue;
+      if(p.id === pid && k === idx) return pool[n % pool.length];
+      n++;
+    }
+  }
+  return pool[0];
+}
+
+/* ---------------- WebGL warp ---------------- */
+let GL = null;
+function glInit(){
+  if(GL) return GL;
+  const c = document.createElement("canvas");
+  const gl = c.getContext("webgl", {alpha:true, premultipliedAlpha:false, antialias:true, preserveDrawingBuffer:true});
+  if(!gl) return null;
+  const vs = `attribute vec3 a_pos; attribute vec2 a_uv; varying vec2 v_uv;
+    void main(){ v_uv = a_uv; gl_Position = vec4(a_pos.x, a_pos.y, 0.0, a_pos.z); }`;
+  const fs = `precision highp float; uniform sampler2D u_tex; uniform float u_gain; varying vec2 v_uv;
+    void main(){ vec4 c = texture2D(u_tex, v_uv); gl_FragColor = vec4(c.rgb * u_gain, c.a); }`;
+  const sh = (t,s)=>{const o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShader(o);
+    if(!gl.getShaderParameter(o,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(o)); return o;};
+  const pr = gl.createProgram();
+  gl.attachShader(pr, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(pr, sh(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(pr); gl.useProgram(pr);
+  const buf = gl.createBuffer(), idx = gl.createBuffer(), tex = gl.createTexture();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idx);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array([0,1,2, 0,2,3]), gl.STATIC_DRAW);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  GL = {c, gl, pr, buf, tex,
+        aPos: gl.getAttribLocation(pr,"a_pos"), aUv: gl.getAttribLocation(pr,"a_uv"),
+        uGain: gl.getUniformLocation(pr,"u_gain")};
+  return GL;
+}
+
+const scratch = document.createElement("canvas"), sctx = scratch.getContext("2d", {willReadFrequently:true});
+/** mean luminance of the photo inside the quad, and of the creative */
+function gainFor(photoImg, pw, ph, px, cimg){
+  try{
+    const S = 220, sc = Math.min(1, S/Math.max(pw,ph));
+    scratch.width = Math.max(2,Math.round(pw*sc)); scratch.height = Math.max(2,Math.round(ph*sc));
+    sctx.drawImage(photoImg, 0, 0, scratch.width, scratch.height);
+    const d = sctx.getImageData(0,0,scratch.width,scratch.height).data;
+    const H = unitToQuad(px);
+    let sum = 0, n = 0;
+    for(let i=1;i<9;i++) for(let j=1;j<9;j++){
+      const v = mmv(H, [i/9, j/9, 1]);
+      const x = Math.round(v[0]/v[2]*sc), y = Math.round(v[1]/v[2]*sc);
+      if(x<0||y<0||x>=scratch.width||y>=scratch.height) continue;
+      const o = (y*scratch.width + x)*4;
+      sum += (d[o]+d[o+1]+d[o+2])/3; n++;
+    }
+    if(!n) return 1;
+    const orig = sum/n;
+    scratch.width = 32; scratch.height = 32;
+    sctx.drawImage(cimg, 0, 0, 32, 32);
+    const e = sctx.getImageData(0,0,32,32).data;
+    let cs = 0; for(let i=0;i<e.length;i+=4) cs += (e[i]+e[i+1]+e[i+2])/3;
+    const nw = cs/(e.length/4);
+    if(nw < 1) return 1;
+    return Math.max(0.80, Math.min(1.22, Math.pow(orig/nw, 0.35)));
+  }catch(e){ return 1; }
+}
+
+const dsc = document.createElement("canvas"), dctx = dsc.getContext("2d");
+function downscaleCreative(img, tw, th){
+  const w = Math.max(8, Math.min(img.naturalWidth || img.width, Math.round(tw*1.35)));
+  const h = Math.max(8, Math.min(img.naturalHeight || img.height, Math.round(th*1.35)));
+  if(w >= (img.naturalWidth||img.width) && h >= (img.naturalHeight||img.height)) return img;
+  dsc.width = w; dsc.height = h;
+  dctx.imageSmoothingEnabled = true; dctx.imageSmoothingQuality = "high";
+  dctx.clearRect(0,0,w,h); dctx.drawImage(img, 0, 0, w, h);
+  const out = document.createElement("canvas");
+  out.width = w; out.height = h; out.getContext("2d").drawImage(dsc, 0, 0);
+  return out;
+}
+
+/** draw every screen of one photo; returns {layer, comp} canvases at native size */
+function renderPhoto(pid, photoImg, wantLayer){
+  const p = photoById(pid);
+  const g = glInit();
+  if(!g) throw new Error("This browser has no WebGL, which the warp needs.");
+  const {gl} = g;
+  g.c.width = p.w; g.c.height = p.h;
+  gl.viewport(0,0,p.w,p.h);
+  gl.clearColor(0,0,0,0); gl.clear(gl.COLOR_BUFFER_BIT);
+
+  (pins[pid]||[]).forEach((item, idx) => {
+    const cr = creativeFor(pid, idx);
+    if(!cr || item.pts.length !== 4) return;
+    const px = quadPx(pid, item.pts);
+    const [tw, th] = quadSize(px);
+    const src = downscaleCreative(cr.img, tw, th);
+
+    gl.bindTexture(gl.TEXTURE_2D, g.tex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src);
+
+    // per-corner homogeneous w so GL interpolates the varying projectively
+    const H = unitToQuad(px);
+    const uv = [[0,0],[1,0],[1,1],[0,1]];
+    let verts = [], flip = 1;
+    const ws = uv.map(([u,v]) => H[6]*u + H[7]*v + H[8]);
+    if(ws.every(w => w < 0)) flip = -1;
+    uv.forEach(([u,v], i) => {
+      const w = ws[i]*flip;
+      const X = (H[0]*u + H[1]*v + H[2])*flip, Y = (H[3]*u + H[4]*v + H[5])*flip;
+      const ndcX = 2*(X/w)/p.w - 1, ndcY = 1 - 2*(Y/w)/p.h;
+      verts.push(ndcX*w, ndcY*w, w, u, v);
+    });
+    gl.bindBuffer(gl.ARRAY_BUFFER, g.buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(verts), gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(g.aPos); gl.vertexAttribPointer(g.aPos, 3, gl.FLOAT, false, 20, 0);
+    gl.enableVertexAttribArray(g.aUv);  gl.vertexAttribPointer(g.aUv,  2, gl.FLOAT, false, 20, 12);
+    gl.uniform1f(g.uGain, gainFor(photoImg, p.w, p.h, px, src));
+    gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+  });
+
+  const comp = document.createElement("canvas");
+  comp.width = p.w; comp.height = p.h;
+  const cx = comp.getContext("2d");
+  cx.drawImage(photoImg, 0, 0);
+  cx.drawImage(g.c, 0, 0);
+
+  let layer = null;
+  if(wantLayer){
+    layer = document.createElement("canvas");
+    layer.width = p.w; layer.height = p.h;
+    layer.getContext("2d").drawImage(g.c, 0, 0);
+  }
+  return {comp, layer};
+}
+
+const imgCache = new Map();
+function loadImage(src){
+  if(imgCache.has(src)) return imgCache.get(src);
+  const pr = new Promise((res, rej) => {
+    const im = new Image();
+    im.onload = () => res(im);
+    im.onerror = () => rej(new Error("could not load "+src));
+    im.src = src;
+  });
+  imgCache.set(src, pr);
+  return pr;
+}
+
+/* ---------------- view 1: placements ---------------- */
+/* Each screen is grouped by the standard DOOH creative it needs: the pinned
+   quad's aspect ratio is snapped to the nearest size below.                   */
+const DOOH_SIZES = [
+  {label:"1920 × 1080", ar:1920/1080},
+  {label:"1280 × 960",  ar:1280/960},
+  {label:"1080 × 1080", ar:1},
+  {label:"960 × 1280",  ar:960/1280},
+  {label:"1080 × 1920", ar:1080/1920},
+];
+const UNPINNED = "Not pinned yet";
+function snapSize(ar){
+  let best = DOOH_SIZES[0], bd = Infinity;
+  for(const s of DOOH_SIZES){ const d = Math.abs(Math.log(ar / s.ar)); if(d < bd){ bd = d; best = s; } }
+  return best.label;
+}
+function photoSize(p){
+  const items = (pins[p.id] || []).filter(i => i.pts.length === 4);
+  if(!items.length) return UNPINNED;
+  let big = items[0], ba = -1;                       // the largest screen decides the group
+  for(const it of items){
+    const [w,h] = quadSize(quadPx(p.id, it.pts));
+    if(w*h > ba){ ba = w*h; big = it; }
+  }
+  const [w,h] = quadSize(quadPx(p.id, big.pts));
+  return snapSize(w/h);
+}
+const sizeOrder = l => { const i = DOOH_SIZES.findIndex(s => s.label === l); return i < 0 ? 99 : i; };
+const livePhotos = () => photos.filter(p => showRemoved || !removed.has(p.id));
+
+/* ---- duplicate detection (16×16 luminance signature, same one the deck matcher uses) ---- */
+const sigCache = new Map();
+async function sigOf(p){
+  if(sigCache.has(p.id)) return sigCache.get(p.id);
+  const s = signature(await loadImage(p.thumb || p.src));
+  sigCache.set(p.id, s);
+  return s;
+}
+const sameShape = (a, b) => Math.abs(Math.log(a / b)) < 0.08;
+async function matchExisting(img){
+  const s = signature(img), ar = img.naturalWidth / img.naturalHeight;
+  for(const p of photos){
+    if(!sameShape(ar, p.w / p.h)) continue;
+    if(sigDist(s, await sigOf(p)) < 10) return p;
+  }
+  return null;
+}
+async function scanDupes(){
+  const list = livePhotos();
+  toast("Comparing " + list.length + " placements\u2026");
+  const sigs = [];
+  for(const p of list) sigs.push(await sigOf(p));
+  dupeOf = {};
+  const flag = new Set();
+  for(let i = 0; i < list.length; i++) for(let j = i + 1; j < list.length; j++){
+    if(!sameShape(list[i].w / list[i].h, list[j].w / list[j].h)) continue;
+    if(sigDist(sigs[i], sigs[j]) < 12){
+      dupeOf[list[j].id] = list[i].id;
+      flag.add(list[j].id);
+    }
+  }
+  selected = new Set(flag);
+  drawGrid(); saveSelection();
+  toast(flag.size
+    ? flag.size + " near-duplicate" + (flag.size > 1 ? "s" : "") + " found and selected \u2014 check them, then Remove selected."
+    : "No near-duplicates found.");
+}
+
+function photoCard(p){
+  const n = (pins[p.id] || []).length;
+  const gone = removed.has(p.id);
+  const c = document.createElement("div");
+  c.className = "card" + (selected.has(p.id) ? " sel" : "") + (gone ? " gone" : "") +
+                (dupeOf[p.id] ? " dupe" : "");
+  c.innerHTML =
+    '<img class="ph" src="' + p.thumb + '" alt="" loading="lazy">' +
+    (gone ? "" : '<span class="tick">&#10003;</span>') +
+    '<button class="edit">' + (gone ? "Restore" : "Pins") + '</button>' +
+    (dupeOf[p.id] ? '<span class="badge">same as ' + dupeOf[p.id].replace("slide-","S") + '</span>' : '') +
+    '<div class="meta"><span class="nm">' + p.id.replace("slide-","S") + '</span>' +
+    '<span class="tag">' + (n > 1 ? n + " screens" : n ? "1 screen" : "no pins") + '</span></div>';
+  if(!gone){
+    c.querySelector(".ph").addEventListener("click", () => toggle(p.id));
+    c.querySelector(".tick").addEventListener("click", () => toggle(p.id));
+  }
+  c.querySelector(".edit").addEventListener("click", e => {
+    e.stopPropagation();
+    if(gone){ removed.delete(p.id); delete dupeOf[p.id]; saveRemoved(); drawGrid(); toast(p.id + " restored."); }
+    else openPins(p.id);
+  });
+  return c;
+}
+
+function buildChips(){
+  const live = livePhotos(), counts = {};
+  live.forEach(p => { const k = photoSize(p); counts[k] = (counts[k] || 0) + 1; });
+  const box = el("chips"); box.innerHTML = "";
+  const mk = (val, label, n) => {
+    const b = document.createElement("button");
+    b.className = "chip"; b.setAttribute("aria-pressed", filter === val ? "true" : "false");
+    b.innerHTML = label + ' <span style="opacity:.55">' + n + '</span>';
+    b.addEventListener("click", () => { filter = val; drawGrid(); });
+    box.appendChild(b);
+  };
+  mk("all", "All", live.length);
+  Object.keys(counts).sort((x, y) => sizeOrder(x) - sizeOrder(y)).forEach(k => mk(k, k, counts[k]));
+
+  const rb = el("show-removed");
+  rb.hidden = removed.size === 0;
+  rb.textContent = "Removed " + removed.size;
+  rb.setAttribute("aria-pressed", showRemoved ? "true" : "false");
+}
+
+function drawGrid(){
+  const g = el("pgrid"); g.innerHTML = "";
+  buildChips();
+  const list = livePhotos().filter(p => filter === "all" || photoSize(p) === filter);
+  const groups = {};
+  list.forEach(p => { const k = photoSize(p); (groups[k] = groups[k] || []).push(p); });
+
+  Object.keys(groups).sort((x, y) => sizeOrder(x) - sizeOrder(y)).forEach(k => {
+    const rows = groups[k];
+    const head = document.createElement("div");
+    head.className = "ghead";
+    head.innerHTML = '<span class="gname">' + k + '</span>' +
+      '<span class="gcount">' + rows.length + " placement" + (rows.length > 1 ? "s" : "") + '</span>' +
+      '<i></i><button class="gsel"></button>';
+    const allOn = rows.every(p => selected.has(p.id));
+    head.querySelector(".gsel").textContent = allOn ? "Deselect group" : "Select group";
+    head.querySelector(".gsel").addEventListener("click", () => {
+      rows.forEach(p => allOn ? selected.delete(p.id) : selected.add(p.id));
+      drawGrid(); saveSelection();
+    });
+    g.appendChild(head);
+    rows.forEach(p => g.appendChild(photoCard(p)));
+  });
+
+  const add = document.createElement("button");
+  add.className = "addcard";
+  add.innerHTML = '<i>+</i><span>Add a placement photo</span>';
+  add.addEventListener("click", () => el("newphoto").click());
+  g.appendChild(add);
+
+  el("selcount").textContent = selected.size + " of " + livePhotos().length + " selected";
+}
+function toggle(id){
+  selected.has(id) ? selected.delete(id) : selected.add(id);
+  drawGrid(); saveSelection();
+}
+el("sel-all").addEventListener("click", ()=>{ livePhotos().forEach(p=>selected.add(p.id)); drawGrid(); saveSelection(); });
+el("sel-none").addEventListener("click", ()=>{ selected.clear(); drawGrid(); saveSelection(); });
+el("scan-dupes").addEventListener("click", () => scanDupes());
+el("show-removed").addEventListener("click", () => { showRemoved = !showRemoved; drawGrid(); });
+el("remove").addEventListener("click", () => {
+  const ids = [...selected].filter(id => !removed.has(id));
+  if(!ids.length) return toast("Select the placements you want out of the library first.", true);
+  ids.forEach(id => { removed.add(id); selected.delete(id); });
+  saveRemoved(); saveSelection(); drawGrid();
+  toast(ids.length + " removed \u2014 they stay in the library; hit \u201cRemoved\u201d to bring them back.");
+});
+
+/* new placement photo */
+const np = document.createElement("input");
+np.type = "file"; np.accept = "image/png,image/jpeg"; np.id = "newphoto"; np.hidden = true;
+document.body.appendChild(np);
+np.addEventListener("change", async () => {
+  const f = np.files[0]; np.value = "";
+  if(!f) return;
+  if(!assets){ toast("Adding photos needs the asset store, which isn't available in this view.", true); return; }
+  try{
+    const url = URL.createObjectURL(f);
+    const im = await loadImage(url);
+    const dup = await matchExisting(im);
+    if(dup){
+      toast("Not added \u2014 that photo is already in the library as " +
+            dup.id.replace("slide-","S") + (removed.has(dup.id) ? " (currently removed)." : "."), true);
+      URL.revokeObjectURL(url);
+      return;
+    }
+    toast("Uploading " + f.name + "\u2026");
+    const r = await assets.upload(f, {type: f.type || "image/jpeg"});
+    const id = "custom-" + r.id.slice(0,10);
+    const rec = {id, w:im.naturalWidth, h:im.naturalHeight, src:r.url, thumb:r.url, custom:true, assetId:r.id};
+    photos.push(rec); pins[id] = []; selected.add(id);
+    imgCache.set(r.url, Promise.resolve(im));
+    if(db) await db.doc("photos/"+id).set({id, assetId:r.id, w:rec.w, h:rec.h, name:f.name, addedAt:new Date().toISOString()});
+    lsSave(); drawGrid(); openPins(id);
+  }catch(e){ toast("Upload failed: " + (e && e.code ? e.code : e.message), true); }
+});
+
+/* ---------------- view 2: creatives ---------------- */
+function addFiles(list){
+  const files = [...list].filter(f => /^image\//.test(f.type));
+  if(!files.length) return;
+  files.sort((a,b) => a.name.localeCompare(b.name, undefined, {numeric:true}));
+  let pending = files.length;
+  files.forEach(f => {
+    const url = URL.createObjectURL(f);
+    const im = new Image();
+    im.onload = () => {
+      creatives.push({name:f.name, img:im, url, w:im.naturalWidth, h:im.naturalHeight,
+                      ratio:im.naturalWidth/im.naturalHeight, group:groupOf(im.naturalWidth/im.naturalHeight)});
+      if(--pending === 0){
+        creatives.sort((a,b) => a.name.localeCompare(b.name, undefined, {numeric:true}));
+        drawCreatives(); markSteps();
+      }
+    };
+    im.onerror = () => { if(--pending === 0){ drawCreatives(); markSteps(); } };
+    im.src = url;
+  });
+}
+function drawCreatives(){
+  const box = el("crlist"); box.innerHTML = "";
+  creatives.forEach((c, i) => {
+    const d = document.createElement("div");
+    d.className = "cr";
+    d.innerHTML = '<img src="'+c.url+'" alt=""><div class="t"><span class="fn">'+c.name+
+      '</span><span class="sub">'+c.w+'×'+c.h+' · '+c.ratio.toFixed(2)+':1 · '+c.group+
+      '</span></div><button class="x" title="Remove">×</button>';
+    d.querySelector(".x").addEventListener("click", () => { creatives.splice(i,1); drawCreatives(); markSteps(); });
+    box.appendChild(d);
+  });
+  // demand vs supply
+  const need = {};
+  photos.forEach(p => { if(!selected.has(p.id)) return;
+    (pins[p.id]||[]).forEach(it => { const g = needFor(p.id, it); need[g] = (need[g]||0)+1; }); });
+  const r = el("ratios"); r.innerHTML = "";
+  Object.keys(need).sort().forEach(g => {
+    const have = creatives.filter(c => c.group === g).length;
+    const s = document.createElement("span");
+    s.className = "pill " + (have ? "ok" : "bad");
+    s.textContent = need[g] + " " + g + " screen" + (need[g]>1?"s":"") + " ← " +
+                    (have ? have + " matching file" + (have>1?"s":"") : "nothing matching yet");
+    r.appendChild(s);
+  });
+}
+el("pick").addEventListener("click", () => el("crfile").click());
+el("crfile").addEventListener("change", e => { addFiles(e.target.files); e.target.value = ""; });
+el("cr-clear").addEventListener("click", () => { creatives = []; drawCreatives(); markSteps(); });
+const dz = el("drop");
+["dragenter","dragover"].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.add("hot"); }));
+["dragleave","drop"].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.remove("hot"); }));
+dz.addEventListener("drop", e => addFiles(e.dataTransfer.files));
+
+/* ---------------- view 3: render ---------------- */
+function activeList(){
+  const out = [];
+  photos.forEach(p => { if(!selected.has(p.id)) return;
+    if((pins[p.id]||[]).some(i => i.pts.length === 4)) out.push(p); });
+  return out;
+}
+async function drawRender(){
+  const body = el("rbody"); body.innerHTML = "";
+  const list = activeList();
+  el("rcount").textContent = list.length + " placement" + (list.length===1?"":"s");
+  if(!creatives.length){
+    body.innerHTML = '<div class="empty"><h2>No creatives loaded</h2>' +
+      '<p class="note">Go back to step 2 and drop in this run’s files. Everything else is already set.</p></div>';
+    return;
+  }
+  const grid = document.createElement("div");
+  grid.className = "rgrid"; body.appendChild(grid);
+  for(const p of list){
+    const cell = document.createElement("div");
+    cell.className = "rc";
+    const cv = document.createElement("canvas");
+    cv.width = 460; cv.height = 345;                 // uniform 4:3 tile; the photo is letterboxed inside
+    const rb = document.createElement("div"); rb.className = "rb";
+    rb.innerHTML = '<span class="rn">'+p.id.replace("slide-","S")+'</span>';
+    cell.appendChild(cv); cell.appendChild(rb); grid.appendChild(cell);
+
+    (pins[p.id]||[]).forEach((item, idx) => {
+      const pool = poolFor(needFor(p.id, item));
+      const sel = document.createElement("select");
+      sel.innerHTML = '<option value="">auto</option>' +
+        pool.map((c,i) => '<option value="'+i+'"'+(item.ov===i?" selected":"")+'>'+c.name+'</option>').join("");
+      sel.addEventListener("change", async () => {
+        item.ov = sel.value === "" ? null : +sel.value;
+        savePins(p.id); await paint(p, cv);
+      });
+      rb.appendChild(sel);
+    });
+    paint(p, cv);
+  }
+}
+async function paint(p, cv){
+  try{
+    const img = await loadImage(p.src);
+    const {comp} = renderPhoto(p.id, img, false);
+    const cx = cv.getContext("2d");
+    cx.imageSmoothingQuality = "high";
+    cx.fillStyle = "#D5E3ED"; cx.fillRect(0, 0, cv.width, cv.height);
+    const s = Math.min(cv.width/comp.width, cv.height/comp.height);
+    const w = comp.width*s, h = comp.height*s;
+    cx.drawImage(comp, (cv.width-w)/2, (cv.height-h)/2, w, h);
+  }catch(e){ /* leave blank */ }
+}
+
+function progress(v){
+  const b = el("prog");
+  b.style.display = v == null ? "none" : "block";
+  if(v != null) b.firstElementChild.style.width = (v*100)+"%";
+}
+async function buildZip(kind){
+  const list = activeList();
+  if(!creatives.length) return toast("Load some creatives first.", true);
+  if(!list.length) return toast("Nothing selected.", true);
+  if(!downloads) return toast("Downloads aren't available in this view.", true);
+  const zip = new JSZip();
+  progress(0);
+  for(let i=0;i<list.length;i++){
+    const p = list[i];
+    const img = await loadImage(p.src);
+    const {comp, layer} = renderPhoto(p.id, img, kind === "png");
+    const cv = kind === "png" ? layer : comp;
+    const blob = await new Promise(r => cv.toBlob(r, kind === "png" ? "image/png" : "image/jpeg", 0.95));
+    zip.file(p.id + (kind === "png" ? ".png" : ".jpg"), blob);
+    progress((i+1)/list.length);
+    await new Promise(r => setTimeout(r));
+  }
+  const out = await zip.generateAsync({type:"blob", compression:"STORE"});
+  progress(null);
+  try{
+    await downloads.save({filename: (kind==="png" ? "warped-layers" : "placement-finals") + ".zip", data: out});
+    toast(list.length + " files ready.");
+  }catch(e){ if(e.code !== "declined") toast("Download failed: " + (e.code||e.message), true); }
+}
+el("dl-jpg").addEventListener("click", () => buildZip("jpg"));
+el("dl-png").addEventListener("click", () => buildZip("png"));
+
+/* ---------------- deck rebuild ---------------- */
+const sigc = document.createElement("canvas"); sigc.width = sigc.height = 16;
+const sigx = sigc.getContext("2d", {willReadFrequently:true});
+function signature(src){
+  sigx.clearRect(0,0,16,16); sigx.drawImage(src, 0, 0, 16, 16);
+  const d = sigx.getImageData(0,0,16,16).data, out = new Float32Array(256);
+  for(let i=0;i<256;i++) out[i] = (d[i*4]+d[i*4+1]+d[i*4+2])/3;
+  return out;
+}
+function sigDist(a,b){ let s=0; for(let i=0;i<256;i++) s += Math.abs(a[i]-b[i]); return s/256; }
+
+el("dl-deck").addEventListener("click", () => el("deckfile").click());
+el("deckfile").addEventListener("change", async e => {
+  const f = e.target.files[0]; e.target.value = "";
+  if(!f) return;
+  if(!creatives.length) return toast("Load creatives first.", true);
+  if(!downloads) return toast("Downloads aren't available in this view.", true);
+  try{
+    progress(0);
+    const zip = await JSZip.loadAsync(f);
+    const media = Object.keys(zip.files).filter(n => /^ppt\/media\/.+\.(png|jpe?g)$/i.test(n));
+    if(!media.length){ progress(null); return toast("No images found in that file.", true); }
+
+    // signatures for our photos
+    const mine = [];
+    for(const p of photos){
+      const im = await loadImage(p.src);
+      mine.push({p, sig: signature(im)});
+    }
+    const renames = {};
+    let hits = 0;
+    for(let i=0;i<media.length;i++){
+      const name = media[i];
+      const blob = await zip.file(name).async("blob");
+      let bm;
+      try{ bm = await createImageBitmap(blob); }catch(err){ continue; }
+      const cand = mine.filter(m => m.p.w === bm.width && m.p.h === bm.height);
+      if(cand.length){
+        const s = signature(bm);
+        let best = null, bd = 1e9;
+        for(const c of cand){ const d = sigDist(s, c.sig); if(d < bd){ bd = d; best = c; } }
+        if(best && bd < 14 && selected.has(best.p.id) && (pins[best.p.id]||[]).some(x=>x.pts.length===4)){
+          const img = await loadImage(best.p.src);
+          const {comp} = renderPhoto(best.p.id, img, false);
+          const jb = await new Promise(r => comp.toBlob(r, "image/jpeg", 0.92));
+          const target = name.replace(/\.(png|jpeg)$/i, ".jpg");
+          zip.file(target, jb);
+          if(target !== name){ zip.remove(name); renames[name.split("/").pop()] = target.split("/").pop(); }
+          hits++;
+        }
+      }
+      bm.close && bm.close();
+      progress((i+1)/media.length);
+    }
+    if(!hits){ progress(null); return toast("None of the deck's images matched a selected placement.", true); }
+
+    for(const rp of Object.keys(zip.files).filter(n => /_rels\/.+\.rels$/.test(n))){
+      let t = await zip.file(rp).async("string"); const o = t;
+      for(const [a,b] of Object.entries(renames)) t = t.split("/"+a+'"').join("/"+b+'"');
+      if(t !== o) zip.file(rp, t);
+    }
+    const out = await zip.generateAsync({type:"blob"});
+    progress(null);
+    const base = f.name.replace(/\.pptx$/i, "");
+    await downloads.save({filename: base + " - Creative Swap.pptx", data: out});
+    toast(hits + " screenshots replaced in the deck.");
+  }catch(err){
+    progress(null);
+    if(err && err.code === "declined") return;
+    toast("Deck rebuild failed: " + (err.code || err.message), true);
+  }
+});
+
+/* ---------------- build an InMarket deck ----------------
+   shell.pptx carries the 2025 template's master, layouts, theme and deck cover.
+   One content slide is cloned per placement; geometry below is the layout's own
+   "Title and Content" placeholder box, so images land where the template expects. */
+const DECK_BOX = {x:300517, y:1600200, w:11585448, h:4576763};
+const NSR = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/";
+const CTYPE = "application/vnd.openxmlformats-officedocument.presentationml.slide+xml";
+const DECK_SLIDE = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+'<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld><p:spTree>' +
+'<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>' +
+'<p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>' +
+'<p:sp><p:nvSpPr><p:cNvPr id="2" name="Title 1"/><p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr>' +
+'<p:spPr/><p:txBody><a:bodyPr><a:normAutofit/></a:bodyPr><a:lstStyle/><a:p><a:r><a:rPr lang="en-US" dirty="0"/><a:t>@@CAP@@</a:t></a:r></a:p></p:txBody></p:sp>' +
+'<p:sp><p:nvSpPr><p:cNvPr id="3" name="Text Placeholder 2"/><p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr><p:nvPr><p:ph type="body" sz="quarter" idx="13"/></p:nvPr></p:nvSpPr>' +
+'<p:spPr/><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang="en-US" dirty="0"/><a:t>@@EYE@@</a:t></a:r></a:p></p:txBody></p:sp>' +
+'<p:pic><p:nvPicPr><p:cNvPr id="4" name="Mockup"/><p:cNvPicPr><a:picLocks noChangeAspect="1"/></p:cNvPicPr><p:nvPr/></p:nvPicPr>' +
+'<p:blipFill><a:blip r:embed="rId2"/><a:stretch><a:fillRect/></a:stretch></p:blipFill>' +
+'<p:spPr><a:xfrm><a:off x="@@X@@" y="@@Y@@"/><a:ext cx="@@CX@@" cy="@@CY@@"/></a:xfrm>' +
+'<a:prstGeom prst="roundRect"><a:avLst><a:gd name="adj" fmla="val 3299"/></a:avLst></a:prstGeom>' +
+'<a:effectLst><a:outerShdw blurRad="50800" dist="50800" dir="5400000" algn="t" rotWithShape="0">' +
+'<a:prstClr val="black"><a:alpha val="10000"/></a:prstClr></a:outerShdw></a:effectLst></p:spPr></p:pic>' +
+'</p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sld>';
+const DECK_RELS = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+'<Relationship Id="rId1" Type="' + NSR + 'slideLayout" Target="../slideLayouts/slideLayout2.xml"/>' +
+'<Relationship Id="rId2" Type="' + NSR + 'image" Target="../media/@@IMG@@"/></Relationships>';
+
+const xesc = s => String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+function captionFor(p){
+  const names = (pins[p.id] || []).map((it, i) => {
+    const cr = creativeFor(p.id, i);
+    return cr ? cr.name.replace(/\.[a-z0-9]+$/i, "").replace(/[_-]+/g, " ").trim() : null;
+  }).filter(Boolean);
+  return [...new Set(names)].join("  +  ") || p.id;
+}
+
+async function makeDeckBlob(title, subhead){
+  const list = activeList();
+  // artifacts don't serve .pptx, so the shell ships base64-encoded as text
+  const res = await fetch("template/shell.b64.txt", {cache:"force-cache"});
+  if(!res.ok) throw new Error("the deck template didn't load (" + res.status + ")");
+  const zip = await JSZip.loadAsync((await res.text()).trim(), {base64:true});
+
+  let cover = await zip.file("ppt/slides/slide1.xml").async("string");
+  zip.file("ppt/slides/slide1.xml",
+           cover.replace("@@TITLE@@", xesc(title)).replace("@@SUBHEAD@@", xesc(subhead)));
+
+  let ct   = await zip.file("[Content_Types].xml").async("string");
+  let pres = await zip.file("ppt/presentation.xml").async("string");
+  let prel = await zip.file("ppt/_rels/presentation.xml.rels").async("string");
+  const ctAdd = [], relAdd = [], sldAdd = [];
+
+  for(let i = 0; i < list.length; i++){
+    const p = list[i], n = i + 2, rid = "rId" + (100 + i), img = "mock" + (i + 1) + ".jpg";
+    const image = await loadImage(p.src);
+    const {comp} = renderPhoto(p.id, image, false);
+    const blob = await new Promise(r => comp.toBlob(r, "image/jpeg", 0.92));
+    const s = Math.min(DECK_BOX.w / p.w, DECK_BOX.h / p.h);
+    const cx = Math.round(p.w * s), cy = Math.round(p.h * s);
+    zip.file("ppt/media/" + img, blob);
+    zip.file("ppt/slides/slide" + n + ".xml", DECK_SLIDE
+      .replace("@@CAP@@", xesc(captionFor(p)))
+      .replace("@@EYE@@", xesc(photoSize(p) + "  ·  " + p.id.replace("slide-","S")))
+      .replace("@@X@@", Math.round(DECK_BOX.x + (DECK_BOX.w - cx) / 2))
+      .replace("@@Y@@", Math.round(DECK_BOX.y + (DECK_BOX.h - cy) / 2))
+      .replace("@@CX@@", cx).replace("@@CY@@", cy));
+    zip.file("ppt/slides/_rels/slide" + n + ".xml.rels", DECK_RELS.replace("@@IMG@@", img));
+    ctAdd.push('<Override PartName="/ppt/slides/slide' + n + '.xml" ContentType="' + CTYPE + '"/>');
+    relAdd.push('<Relationship Id="' + rid + '" Type="' + NSR + 'slide" Target="slides/slide' + n + '.xml"/>');
+    sldAdd.push('<p:sldId id="' + (300 + i) + '" r:id="' + rid + '"/>');
+    progress((i + 1) / list.length);
+    await new Promise(r => setTimeout(r));
+  }
+  zip.file("[Content_Types].xml", ct.replace("</Types>", ctAdd.join("") + "</Types>"));
+  zip.file("ppt/_rels/presentation.xml.rels", prel.replace("</Relationships>", relAdd.join("") + "</Relationships>"));
+  zip.file("ppt/presentation.xml", pres.replace("</p:sldIdLst>", sldAdd.join("") + "</p:sldIdLst>"));
+  return {blob: await zip.generateAsync({type:"blob"}), count: list.length};
+}
+
+el("mk-deck").addEventListener("click", async () => {
+  if(!creatives.length) return toast("Load this run's creatives first.", true);
+  if(!activeList().length) return toast("Nothing selected.", true);
+  if(!downloads) return toast("Downloads aren't available in this view.", true);
+  const title = (el("deck-title").value || "DOOH Proof of Placement").trim();
+  const sub   = (el("deck-sub").value || "").trim();
+  try{
+    progress(0);
+    const {blob, count} = await makeDeckBlob(title, sub);
+    progress(null);
+    await downloads.save({filename: title.replace(/[\\/:*?"<>|]/g,"-") + ".pptx", data: blob});
+    toast(count + " placement slides built on the InMarket template.");
+    if(db) db.doc("prefs/deck").set({title, sub, updatedAt:new Date().toISOString()}).catch(()=>{});
+  }catch(e){
+    progress(null);
+    if(e && e.code === "declined") return;
+    toast("Deck build failed: " + (e.code || e.message), true);
+  }
+});
+
+/* ---------------- pin editor ---------------- */
+let pe = {pid:null, zoom:1, panX:0, panY:0, fit:1, item:0, drag:null, pan:null, moved:false, backup:null};
+const pstage = el("pstage"), pscene = el("pscene"), pimg = el("pimg"), ppins = el("ppins");
+const ploupe = el("ploupe"), plx = ploupe.querySelector("canvas").getContext("2d");
+
+function openPins(pid){
+  pe.pid = pid; pe.item = 0;
+  pe.backup = JSON.parse(JSON.stringify(pins[pid] || []));
+  if(!pins[pid]) pins[pid] = [];
+  if(!pins[pid].length) pins[pid].push({pts:[], ov:null});
+  const p = photoById(pid);
+  el("pnm").textContent = pid + "  ·  " + p.w + "×" + p.h;
+  pimg.src = p.src; pimg.width = p.w; pimg.height = p.h;
+  pscene.style.width = p.w+"px"; pscene.style.height = p.h+"px";
+  el("pindlg").showModal();
+  const go = () => { pfit(); pdraw(); };
+  pimg.complete ? go() : pimg.onload = go;
+  pdraw();
+}
+function pfit(){
+  const p = photoById(pe.pid);
+  pe.fit = Math.min((pstage.clientWidth-36)/p.w, (pstage.clientHeight-36)/p.h);
+  pe.zoom = pe.fit;
+  pe.panX = (pstage.clientWidth - p.w*pe.zoom)/2;
+  pe.panY = (pstage.clientHeight - p.h*pe.zoom)/2;
+  papply();
+}
+function papply(){
+  pscene.style.transform = "translate("+pe.panX+"px,"+pe.panY+"px) scale("+pe.zoom+")";
+  pdrawPins();
+}
+function pToScene(ev){
+  const r = pstage.getBoundingClientRect();
+  return [(ev.clientX - r.left - pe.panX)/pe.zoom, (ev.clientY - r.top - pe.panY)/pe.zoom];
+}
+function pdrawPins(){
+  const p = photoById(pe.pid), items = pins[pe.pid] || [];
+  ppins.setAttribute("width", p.w); ppins.setAttribute("height", p.h);
+  ppins.style.width = p.w+"px"; ppins.style.height = p.h+"px";
+  const rr = 7/pe.zoom, sw = 1.6/pe.zoom;
+  let s = "";
+  items.forEach((it, ii) => {
+    const px = quadPx(pe.pid, it.pts), act = ii === pe.item, col = act ? "#84D828" : "#AED7F4";
+    if(px.length > 1) s += '<polygon points="'+px.map(q=>q[0].toFixed(1)+","+q[1].toFixed(1)).join(" ")+
+      '" fill="'+(act?"rgba(132,216,40,.12)":"rgba(174,215,244,.08)")+'" stroke="'+col+
+      '" stroke-width="'+sw+'" stroke-dasharray="'+(6/pe.zoom)+' '+(4/pe.zoom)+'"/>';
+    px.forEach((q,i) => {
+      s += '<circle cx="'+q[0]+'" cy="'+q[1]+'" r="'+rr+'" fill="rgba(18,30,51,.78)" stroke="'+col+'" stroke-width="'+(2/pe.zoom)+'"/>';
+      s += '<circle cx="'+q[0]+'" cy="'+q[1]+'" r="'+(1.8/pe.zoom)+'" fill="'+col+'"/>';
+      if(act) s += '<text x="'+(q[0]+rr+3/pe.zoom)+'" y="'+(q[1]-rr)+'" fill="'+col+'" font-size="'+(12/pe.zoom)+
+        '" font-family="Montserrat, sans-serif">'+(i+1)+'</text>';
+    });
+  });
+  ppins.innerHTML = s;
+  // live overlay
+  [...pscene.querySelectorAll("img.ov")].forEach(n => n.remove());
+  items.forEach((it, ii) => {
+    if(it.pts.length !== 4) return;
+    const cr = creativeFor(pe.pid, ii) || creatives[0];
+    if(!cr) return;
+    const im = document.createElement("img");
+    im.className = "ov"; im.src = cr.url;
+    const BW = 1000, BH = Math.round(1000*cr.h/cr.w);
+    im.style.width = BW+"px"; im.style.height = BH+"px"; im.style.pointerEvents = "none";
+    im.style.transform = cssMatrix(BW, BH, quadPx(pe.pid, it.pts));
+    pscene.insertBefore(im, ppins);
+  });
+}
+function pdraw(){
+  const items = pins[pe.pid] || [], it = items[pe.item] || {pts:[]};
+  const box = el("pplist"); box.innerHTML = "";
+  items.forEach((x, i) => {
+    const row = document.createElement("div");
+    row.className = "prow"; row.setAttribute("aria-current", i === pe.item ? "true" : "false");
+    row.innerHTML = '<button class="tx">screen '+(i+1)+' · '+x.pts.length+'/4</button>' +
+                    (items.length > 1 ? '<button class="x">×</button>' : '');
+    row.querySelector(".tx").addEventListener("click", () => { pe.item = i; pdraw(); });
+    const rx = row.querySelector(".x");
+    if(rx) rx.addEventListener("click", () => { items.splice(i,1); pe.item = 0; savePins(pe.pid); pdraw(); });
+    box.appendChild(row);
+  });
+  const p = photoById(pe.pid);
+  el("pcoords").innerHTML = CORNERS.map((n,i) => {
+    const q = it.pts[i];
+    return '<div><span>'+n+'</span><span>'+(q ? Math.round(q[0]*p.w)+", "+Math.round(q[1]*p.h) : "—")+'</span></div>';
+  }).join("");
+  el("phint").innerHTML = it.pts.length < 4
+    ? 'Click the <b>'+CORNERS[it.pts.length]+'</b> corner ('+it.pts.length+'/4)'
+    : 'All four set — drag a dot to nudge';
+  pdrawPins();
+}
+pstage.addEventListener("pointerdown", ev => {
+  const [sx, sy] = pToScene(ev), p = photoById(pe.pid), items = pins[pe.pid] || [];
+  pe.moved = false;
+  const tol = 11/pe.zoom;
+  for(let ii=0; ii<items.length; ii++)
+    for(let i=0; i<items[ii].pts.length; i++){
+      const q = [items[ii].pts[i][0]*p.w, items[ii].pts[i][1]*p.h];
+      if(Math.hypot(q[0]-sx, q[1]-sy) < tol){
+        pe.item = ii; pe.drag = {ii,i}; pstage.setPointerCapture(ev.pointerId); pdraw(); return;
+      }
+    }
+  pe.pan = {x:ev.clientX, y:ev.clientY, px:pe.panX, py:pe.panY, click:true};
+  pstage.setPointerCapture(ev.pointerId);
+});
+pstage.addEventListener("pointermove", ev => {
+  const p = photoById(pe.pid);
+  if(pe.drag){
+    const [sx, sy] = pToScene(ev);
+    pins[pe.pid][pe.drag.ii].pts[pe.drag.i] =
+      [Math.max(0,Math.min(1,sx/p.w)), Math.max(0,Math.min(1,sy/p.h))];
+    pdrawPins(); ploupeAt(ev); return;
+  }
+  if(pe.pan){
+    const dx = ev.clientX - pe.pan.x, dy = ev.clientY - pe.pan.y;
+    if(Math.abs(dx)+Math.abs(dy) > 4){ pe.moved = true; pe.panX = pe.pan.px+dx; pe.panY = pe.pan.py+dy; papply(); }
+    return;
+  }
+  ploupeAt(ev);
+});
+pstage.addEventListener("pointerup", ev => {
+  const p = photoById(pe.pid);
+  if(pe.drag){ pe.drag = null; savePins(pe.pid); pdraw(); return; }
+  if(pe.pan){
+    const click = pe.pan.click && !pe.moved; pe.pan = null;
+    if(!click) return;
+    const it = pins[pe.pid][pe.item];
+    if(it.pts.length >= 4) return;
+    const [sx, sy] = pToScene(ev);
+    if(sx < 0 || sy < 0 || sx > p.w || sy > p.h) return;
+    it.pts.push([sx/p.w, sy/p.h]);
+    savePins(pe.pid); pdraw();
+  }
+});
+pstage.addEventListener("pointerleave", () => ploupe.style.display = "none");
+pstage.addEventListener("wheel", ev => {
+  ev.preventDefault();
+  const r = pstage.getBoundingClientRect(), mx = ev.clientX-r.left, my = ev.clientY-r.top;
+  const nz = Math.min(24, Math.max(pe.fit*0.4, pe.zoom*Math.exp(-ev.deltaY*0.0016)));
+  pe.panX = mx - (mx-pe.panX)*(nz/pe.zoom);
+  pe.panY = my - (my-pe.panY)*(nz/pe.zoom);
+  pe.zoom = nz; papply();
+}, {passive:false});
+function ploupeAt(ev){
+  if(!pimg.naturalWidth) return;
+  const [sx, sy] = pToScene(ev), p = photoById(pe.pid);
+  if(sx<0||sy<0||sx>p.w||sy>p.h){ ploupe.style.display = "none"; return; }
+  const nx = sx*pimg.naturalWidth/p.w, ny = sy*pimg.naturalHeight/p.h, S = 140, src = S/5;
+  plx.imageSmoothingEnabled = false;
+  plx.fillStyle = "#000"; plx.fillRect(0,0,S,S);
+  plx.drawImage(pimg, nx-src/2, ny-src/2, src, src, 0, 0, S, S);
+  const r = pstage.getBoundingClientRect();
+  let lx = ev.clientX-r.left+22, ly = ev.clientY-r.top-162;
+  if(lx+S > pstage.clientWidth) lx = ev.clientX-r.left-S-22;
+  if(ly < 4) ly = ev.clientY-r.top+22;
+  ploupe.style.left = lx+"px"; ploupe.style.top = ly+"px"; ploupe.style.display = "block";
+}
+el("padd").addEventListener("click", () => {
+  pins[pe.pid].push({pts:[], ov:null}); pe.item = pins[pe.pid].length-1; pdraw();
+});
+el("pundo").addEventListener("click", () => {
+  const it = pins[pe.pid][pe.item]; if(it.pts.length) it.pts.pop(); savePins(pe.pid); pdraw();
+});
+el("pclear").addEventListener("click", () => {
+  pins[pe.pid][pe.item].pts = []; savePins(pe.pid); pdraw();
+});
+el("preset").addEventListener("click", () => {
+  pins[pe.pid] = JSON.parse(JSON.stringify(pe.backup)); pe.item = 0; savePins(pe.pid); pdraw();
+});
+el("pdone").addEventListener("click", () => {
+  el("pindlg").close(); drawGrid();
+  if(view === "render") drawRender();
+});
+
+/* ---------------- navigation ---------------- */
+function markSteps(){
+  document.querySelectorAll(".step").forEach(s => {
+    s.setAttribute("aria-current", s.dataset.v === view ? "true" : "false");
+    s.classList.toggle("done",
+      (s.dataset.v === "place" && selected.size > 0 && view !== "place") ||
+      (s.dataset.v === "creative" && creatives.length > 0 && view !== "creative"));
+  });
+  const g = el("go");
+  g.textContent = view === "render" ? "Download JPGs" : "Continue →";
+  g.disabled = view === "creative" && !creatives.length;
+}
+function show(v){
+  view = v;
+  el("v-place").hidden = v !== "place";
+  el("v-creative").hidden = v !== "creative";
+  el("v-render").hidden = v !== "render";
+  markSteps();
+  if(v === "creative") drawCreatives();
+  if(v === "render") drawRender();
+  document.querySelector("main").scrollTop = 0;
+}
+document.querySelectorAll(".step").forEach(s => s.addEventListener("click", () => show(s.dataset.v)));
+el("go").addEventListener("click", () => {
+  if(view === "place") show("creative");
+  else if(view === "creative") show("render");
+  else buildZip("jpg");
+});
+
+/* ---------------- boot ---------------- */
+try{
+  const raw = localStorage.getItem(lsKey);
+  if(raw){
+    const s = JSON.parse(raw);
+    if(s.pins) for(const k of Object.keys(s.pins)) if(pins[k] || s.custom?.some(c=>c.id===k)) pins[k] = s.pins[k];
+    if(Array.isArray(s.custom)) s.custom.forEach(c => { if(!photoById(c.id)) photos.push(c); });
+    if(Array.isArray(s.rm)) removed = new Set(s.rm.filter(id => photoById(id)));
+    if(Array.isArray(s.sel)){ selected = new Set(s.sel.filter(id => photoById(id))); }
+  }
+}catch(e){}
+drawGrid(); markSteps();
+el("deck-sub").value = "PROOF OF PLACEMENT \u00b7 " +
+  new Date().toLocaleString("en-US", {month:"long", year:"numeric"}).toUpperCase();
+
+(async () => {
+  try{
+    db        = await window.__cap("db");
+    downloads = await window.__cap("downloads");
+    assets    = await window.__cap("assets");
+    el("conn").textContent = db ? "saved to this site" : "saved in this browser";
+    el("conn").className = "ok";
+    if(!db){ await window.__rehydrate(); return; }
+
+    const cust = await db.collection("photos").get();
+    (cust.docs || []).forEach(d => {
+      const v = d.data();
+      if(!v || !v.id || photoById(v.id)) return;
+      photos.push({id:v.id, w:v.w, h:v.h, src:"/_blob/"+v.assetId, thumb:"/_blob/"+v.assetId,
+                   custom:true, assetId:v.assetId});
+    });
+    const snap = await db.collection("pins").get();
+    (snap.docs || []).forEach(d => {
+      const v = d.data();
+      if(!v || !v.photo || !photoById(v.photo)) return;
+      pins[v.photo] = (v.items || []).map(i => ({pts:i.points, ov:(i.override==null?null:i.override)}));
+    });
+    const dk = await db.doc("prefs/deck").get();
+    if(dk.exists){
+      el("deck-title").value = dk.data().title || "";
+      el("deck-sub").value = dk.data().sub || "";
+    }
+    const rem = await db.doc("prefs/removed").get();
+    if(rem.exists && Array.isArray(rem.data().ids))
+      removed = new Set(rem.data().ids.filter(id => photoById(id)));
+    const pref = await db.doc("prefs/selection").get();
+    if(pref.exists && Array.isArray(pref.data().ids)){
+      const ids = pref.data().ids.filter(id => photoById(id));
+      if(ids.length) selected = new Set(ids);
+    }
+    lsSave(); drawGrid(); markSteps();
+  }catch(e){ el("conn").textContent = "local only"; }
+})();
+</script>
+
+</body>
+</html>
